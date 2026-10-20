@@ -1,0 +1,5 @@
+.git
+*.md
+!README.md
+hc2g
+docker-compose*.yml

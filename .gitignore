@@ -1,0 +1,7 @@
+*.log
+data/
+hc2g
+hikcloud2gortc
+*.tar.gz
+.DS_Store
+hikcloud2gortc.pptx

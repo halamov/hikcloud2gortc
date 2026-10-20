@@ -1,0 +1,75 @@
+# hikcloud2gortc: Hik-Connect NVR → локальный HTTP-сервис потока и снапшотов (Go)
+#
+# Сборка и запуск:
+#   cp .env.example .env          # вписать HIK_USER / HIK_PASSWORD / HIKCLOUD2GORTC_TAG
+#   docker compose up -d --build
+#
+# Тег образа: 0.<ГГ><ММ><ДД>.<ЧЧ> (время сборки), генерация:
+#   HIKCLOUD2GORTC_TAG=0.$(date +%y%m%d.%H)   # → напр. 0.261020.00
+#
+# Сервис:
+#   hikcloud2gortc — Go/net/http (:8001): логин в облако Hik-Connect,
+#                  VTM-воркеры расшифровки (HEVC+H.264), ring buffer + ffmpeg-remux
+#
+# Как смотреть (HOST = <host>):
+#   Поток (MPEG-TS, HEVC) — VLC «Открыть URL» / ffplay:
+#     http://HOST:8001/stream.ts?channel=8&stream=sub    # 640x360
+#     http://HOST:8001/stream.ts?channel=8&stream=main   # 1920x1080
+#   Снапшот — браузер / curl:
+#     http://HOST:8001/snapshot?channel=8                # из облака, ~352x288
+#     http://HOST:8001/frame?channel=8&stream=main       # FullHD-кадр из потока
+#   Превью-сетка всех камер:
+#     http://HOST:8001/preview
+#
+# Порт 8001 выбран, чтобы стоять рядом с python-версией hikcloud2rtc (:8000)
+# во время A/B-сравнения; после переключения можно вернуть 8000.
+
+services:
+  hikcloud2gortc:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: hikcloud2gortc:${HIKCLOUD2GORTC_TAG:?set HIKCLOUD2GORTC_TAG in .env}
+    container_name: hikcloud2gortc
+    hostname: hikcloud2gortc
+    network_mode: bridge
+    restart: unless-stopped
+    # console-лог: без блока logging — наследуем глобальный дефолт демона
+    # (/etc/docker/daemon.json: json-file max-size 10m, max-file 1)
+    ports:
+      - "8001:8001"      # Go API: /health /cameras /snapshot /frame /stream.ts /preview /workers /logs
+    environment:
+      # логин Hik-Connect (обязательно, через .env)
+      - HIK_USER=${HIK_USER:?set HIK_USER in .env}
+      - HIK_PASSWORD=${HIK_PASSWORD:?set HIK_PASSWORD in .env}
+      # платформа облака: hikconnect (дефолт) | ezviz
+      - HIK_PLATFORM=${HIK_PLATFORM:-hikconnect}
+      - PORT=8001
+      # данные (token.json, cam_keys.json) живут в volume (compose: hikcloud2gortc_data)
+      - DATA_DIR=/data
+      # сглаживание кадровых bursts облака (GOP приходит за раз, затем пауза):
+      # 1 = ровный поток (буфер ~1 с), 0 = минимальная задержка
+      - PACE_FRAMES=${PACE_FRAMES:-1}
+      # Режим воркеров:
+      #   always — воркеры 24/7 (тёплый поток, постоянный трафик с облака)
+      #   idle   — воркер убивается через WORKER_IDLE_TIMEOUT с без клиентов
+      #            (сценарий «звонок в домофон»; разбудить: GET /prime?channel=N)
+      - WORKER_MODE=${WORKER_MODE:-always}
+      - WORKER_IDLE_TIMEOUT=${WORKER_IDLE_TIMEOUT:-90}
+      # Как /snapshot и /frame отвечают на недоступную камеру:
+      #   error    — HTTP 502/504
+      #   nosignal — 200 + JPEG «NO SIGNAL / камера оффлайн» (+ X-Error заголовки)
+      - OFFLINE_RESPONSE=${OFFLINE_RESPONSE:-error}
+      # часовой пояс контейнера (время в шапке /preview, логи)
+      - TZ=${TZ:-UTC}
+    volumes:
+      - data:/data       # token.json + cam_keys.json переживают рестарт
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  data:
