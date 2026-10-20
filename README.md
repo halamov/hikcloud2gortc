@@ -250,7 +250,7 @@ fonts/                   DejaVu (go:embed) для NO SIGNAL-плиток и /pre
 
 ## Ресурсы (A/B против Python-оригинала, cam8, idle-режим, 2026-10-20)
 
-Замер в одну сессию, запущен из Hermes-Sandbox на home-nuc2, контейнеры
+Замер в одну сессию, запущен с тестового сервера на прод-сервере, контейнеры
 только передеплоены начисто (stop → delete → deploy): Go, пауза 100 с
 (reaper), затем Python. Режимы: idle-статс → cold frame → warm frame →
 snapshot → sub 12 с → main 12 с (статс под нагрузкой) → reaper 100 с.
