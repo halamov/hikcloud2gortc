@@ -7,8 +7,8 @@ MPEG-TS по HTTP играют VLC/ffplay.
 
 Полный порт на Go [`hikcloud2rtc`](https://github.com/halamov/hikcloud2rtc)
 (FastAPI + `cloudcam/decrypt_proxy` + ffmpeg) — один и тот же набор эндпоинтов
-и переменных окружения; Go-сервис занимает порт **8001**, чтобы стоять рядом
-с Python-версией (:8000).
+и переменных окружения. Go-сервис занимает порт **8000** (python-версия
+остановлена после A/B-сравнения; во время сравнения Go стоял на 8001).
 
 ## Проекты-основы
 
@@ -38,16 +38,16 @@ docker compose up -d --build
 
 **ffplay (терминал):**
 ```bash
-ffplay http://<host>:8001/stream.ts?channel=8&stream=sub
-ffplay http://<host>:8001/stream.ts?channel=8&stream=main
+ffplay http://<host>:8000/stream.ts?channel=8&stream=sub
+ffplay http://<host>:8000/stream.ts?channel=8&stream=main
 ```
 
 **VLC:** Медиа → Открыть URL →
-`http://<host>:8001/stream.ts?channel=8&stream=main`
+`http://<host>:8000/stream.ts?channel=8&stream=main`
 
 **Записать 60 с:**
 ```bash
-ffmpeg -i "http://<host>:8001/stream.ts?channel=8&stream=main" -t 60 -c copy rec.ts
+ffmpeg -i "http://<host>:8000/stream.ts?channel=8&stream=main" -t 60 -c copy rec.ts
 ```
 
 Первые кадры появляются через 2–15 с (воркер открывает VTM-сессию и ждёт
@@ -57,14 +57,14 @@ ffmpeg -i "http://<host>:8001/stream.ts?channel=8&stream=main" -t 60 -c copy rec
 
 **Из облака** — быстро (~1.5–2 с), фиксированное разрешение ~352×288:
 ```bash
-curl -o cam8.jpg "http://<host>:8001/snapshot?channel=8"
+curl -o cam8.jpg "http://<host>:8000/snapshot?channel=8"
 ```
 (или просто открыть URL в браузере)
 
 **FullHD-кадр из main-потока** — реальный декодированный кадр 1920×1080,
 ~4–6 с (ожидание ключевого кадра):
 ```bash
-curl -o cam8_hd.jpg "http://<host>:8001/frame?channel=8&stream=main"
+curl -o cam8_hd.jpg "http://<host>:8000/frame?channel=8&stream=main"
 ```
 
 ### Камера недоступна — что отвечать (опция `OFFLINE_RESPONSE`)
@@ -101,7 +101,7 @@ X-Camera: CH 11
 
 Один JPEG со снапшотами всех камер облака:
 ```bash
-curl -o wall.jpg "http://<host>:8001/preview"
+curl -o wall.jpg "http://<host>:8000/preview"
 # параметры: cell=120..640   — ширина ячейки, px (дефолт 320)
 #            workers=1..16   — сколько снапшотов снимать параллельно (дефолт 8)
 #            quality=40..95  — качество JPEG (дефолт 88)
@@ -149,8 +149,8 @@ services:
     ports: ["8554:8554", "1984:1984"]
     environment:
       GO2RTC_CONFIG_STREAMS: >
-        cam8: "ffmpeg:http://<host>:8001/stream.ts?channel=8&stream=sub#video=copy"
-        cam8_main: "ffmpeg:http://<host>:8001/stream.ts?channel=8&stream=main#video=copy"
+        cam8: "ffmpeg:http://<host>:8000/stream.ts?channel=8&stream=sub#video=copy"
+        cam8_main: "ffmpeg:http://<host>:8000/stream.ts?channel=8&stream=main#video=copy"
 ```
 Потом: `rtsp://<host>:8554/cam8`, `rtsp://<host>:8554/cam8_main`,
 HLS `:8080/cam8/index.m3u8`, Web-плеер `:1984`.
@@ -221,8 +221,8 @@ PacedWriter в воркере сглаживает это, выдавая кад
 # из контейнера / на хосте
 docker logs hikcloud2gortc --tail 100 -f
 # через API (без доступа к хосту)
-curl "http://<host>:8001/logs?tail=50"
-curl "http://<host>:8001/logs?worker=worker_J88212190_8_main&tail=20"
+curl "http://<host>:8000/logs?tail=50"
+curl "http://<host>:8000/logs?worker=worker_J88212190_8_main&tail=20"
 ```
 
 ## Сборка
@@ -255,7 +255,7 @@ fonts/                   DejaVu (go:embed) для NO SIGNAL-плиток и /pre
 (reaper), затем Python. Режимы: idle-статс → cold frame → warm frame →
 snapshot → sub 12 с → main 12 с (статс под нагрузкой) → reaper 100 с.
 
-| Метрика | Python (`:8000`) | Go (`:8001`) |
+| Метрика | Python (`:8000`) | Go (`:8001` в A/B-период) |
 |---|---|---|
 | Память: idle / под нагрузкой / после reaper, МБ | 53 / 124 / 75 | 2.6 / 27 / 28 |
 | CPU под нагрузкой (main-стрим 12 с), % | 16.7 | 13.7 |
