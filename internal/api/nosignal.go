@@ -269,11 +269,19 @@ func (s *Server) offlineJPEGResponse(w http.ResponseWriter, code int, reason, la
 	w.Header().Set("Content-Type", "image/jpeg")
 	w.Header().Set("X-Camera-Status", "no-signal")
 	w.Header().Set("X-Error", itoa(code))
-	w.Header().Set("X-Error-Reason", safeText(reasonS)[:200])
+	reasonH := safeText(reasonS)
+	if len(reasonH) > 200 {
+		reasonH = reasonH[:200]
+	}
+	w.Header().Set("X-Error-Reason", reasonH)
 	if label != "" {
 		w.Header().Set("X-Camera", label)
 	}
-	s.log.Info("камера офлайн -> NO SIGNAL", "w", width, "h", height, "code", code, "reason", reasonS[:80])
+	reasonL := reasonS
+	if len(reasonL) > 80 {
+		reasonL = reasonL[:80]
+	}
+	s.log.Info("камера офлайн -> NO SIGNAL", "w", width, "h", height, "code", code, "reason", reasonL)
 	_, _ = w.Write(jpeg)
 	return true
 }
