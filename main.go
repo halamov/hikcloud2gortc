@@ -50,7 +50,7 @@ func main() {
 	}
 
 	cache := cloudcam.NewVtmCache(cfg.TokenFile)
-	snap := cloudcam.NewSnapClient(cfg.User, cfg.Password)
+	snap := cloudcam.NewSnapClient(cfg.User, cfg.Password, log)
 	mgr := worker.NewManager(client, cache, cfg.DataDir, cfg.WorkerMode, int(cfg.WorkerIdleTimeout), cfg.PaceFrames, log)
 
 	srv := api.NewServer(api.Config{

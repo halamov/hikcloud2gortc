@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -36,18 +37,32 @@ type SnapClient struct {
 	baseURL    string
 	feature    string
 	sessionID  string
+	loginAt    time.Time
+
+	log *slog.Logger
 
 	mu   sync.Mutex
 	http *http.Client
 }
 
-func NewSnapClient(user, pass string) *SnapClient {
+// snapSessionTTL — проактивный перезалив: сессия снапшот-клиента облака
+// живёт ограниченное время (~4–5 мин без активности; активный опрос —
+// 14+ мин, замер 2026-10-20). После истечения pagelist молча возвращает
+// meta 200 с нулём устройств вместо 401, и снапшоты падают «no active
+// cameras in cloud». Перезаливаемся сами, пока сессия ещё в пределах TTL.
+const snapSessionTTL = 4 * time.Minute
+
+func NewSnapClient(user, pass string, log *slog.Logger) *SnapClient {
 	fc, _ := randHex(16)
+	if log == nil {
+		log = slog.Default()
+	}
 	return &SnapClient{
 		user:    user,
 		pass:    pass,
 		baseURL: "https://api.hik-connect.com",
 		feature: fc,
+		log:     log,
 		http:    &http.Client{Timeout: 30 * time.Second},
 	}
 }
@@ -108,7 +123,30 @@ func checkMeta(payload map[string]any) error {
 func (s *SnapClient) Login() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.loginOnce()
+	err := s.loginOnce()
+	if err != nil {
+		s.log.Error("snap: логин в облако не удался", "err", err)
+		return err
+	}
+	s.log.Info("snap: логин в облако ok", "domain", s.baseURL)
+	return nil
+}
+
+// ensureSession — живая сессия: либо свежая (моложе snapSessionTTL), либо
+// новый логин. Вызывать вне s.mu.
+func (s *SnapClient) ensureSession() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sessionID != "" && time.Since(s.loginAt) < snapSessionTTL {
+		return nil
+	}
+	err := s.loginOnce()
+	if err != nil {
+		s.log.Error("snap: ре-логин не удался", "err", err)
+		return err
+	}
+	s.log.Info("snap: ре-логин в облако ok (сессия протухла/нет)", "domain", s.baseURL)
+	return nil
 }
 
 func (s *SnapClient) loginOnce() error {
@@ -160,6 +198,7 @@ func (s *SnapClient) loginOnce() error {
 		return errors.New("login: нет sessionId")
 	}
 	s.sessionID = sid
+	s.loginAt = time.Now()
 	return nil
 }
 
@@ -201,13 +240,8 @@ func (s *SnapClient) requestJSON(method, path string, query url.Values, body str
 }
 
 func (s *SnapClient) requestJSONAuth(method, path string, query url.Values, body string) (map[string]any, error) {
-	s.mu.Lock()
-	sid := s.sessionID
-	s.mu.Unlock()
-	if sid == "" {
-		if err := s.Login(); err != nil {
-			return nil, err
-		}
+	if err := s.ensureSession(); err != nil {
+		return nil, err
 	}
 	p, err := s.requestJSON(method, path, query, body)
 	if err == nil {
@@ -232,7 +266,32 @@ func isAuthReject(err error) bool {
 const deviceFilter = "TIME_PLAN,CONNECTION,SWITCH,STATUS,STATUS_EXT,WIFI,NODISTURB,P2P,KMS,HIDDNS"
 
 // ListCameras — все активные каналы аккаунта (портировка list_cameras).
+// Пустой результат — подозрительный: облако молча роняет просроченную
+// сессию (meta 200, deviceInfos=[]), поэтому один раз форсируем ре-логин
+// и повторяем. Найдено в проде 2026-10-20: снапшоты падали «no active
+// cameras in cloud» через ~9 мин после запуска контейнера.
 func (s *SnapClient) ListCameras() ([]Camera, error) {
+	out, err := s.listCamerasOnce()
+	if err != nil {
+		return nil, err
+	}
+	if len(out) == 0 {
+		s.log.Info("snap: список камер пуст — принудительный ре-логин")
+		if err := s.Login(); err != nil {
+			return nil, err
+		}
+		out, err = s.listCamerasOnce()
+		if err != nil {
+			return nil, err
+		}
+		if len(out) == 0 {
+			s.log.Warn("snap: камер нет даже после ре-логина")
+		}
+	}
+	return out, nil
+}
+
+func (s *SnapClient) listCamerasOnce() ([]Camera, error) {
 	out := []Camera{}
 	offset := 0
 	for {
