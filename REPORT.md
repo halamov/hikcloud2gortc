@@ -48,6 +48,16 @@
     парсился и логировался, но воркер писал прямо в ring — сглаживание GOP-
     bursts не работало. Подключено: Annex-B-поток → PacedWriter → ring
     (pass-through TS — напрямую, NAL-границ в TS нет).
+11. **Сессия снапшот-клиента протухала молча** (2026-10-20): облако роняет
+    сессию Hik-Connect через ~4 мин бездействия (meta 200 + `deviceInfos=[]`,
+    НЕ 401) → `/snapshot` и `/preview` отдавали 500 "no active cameras",
+    лог молчал. Фикс: `snapSessionTTL=4min` + проактивный re-login в
+    `ensureSession()` + retry при пустом списке камер + логирование
+    (`3c26e79`).
+12. **Паника slice на короткой причине оффлайна** (батарея #3, 2026-10-20):
+    в `OFFLINE_RESPONSE=nosignal` на оффлайн-камере `reasonS[:200]`
+    (заголовок) и `reasonS[:80]` (лог) падали, если причина короче среза →
+    запрос умирал обрывом соединения. Guarded-срезы (`34c8b0a`).
 
 ## Ревизия кода (2026-10-20)
 `go vet` + staticcheck + ручной аудит на «лишнее из опорных проектов»:
@@ -142,3 +152,64 @@ Python быстрее в тёплом /frame (1.3 с vs 3.5 с — отдаёт 
 Данные: `/tmp/batt-go.jsonl` (45 событий) + `/tmp/batt-go-mem.csv` (177
 сэмплов) на hik; скрипты `batt_go.sh`/`batt_test.py`/`batt_pulse.py` в
 `~/.hermes/cache/scratch/`.
+
+## Батарея #3: все комбинации параметров + параллельные эндпоинты (2026-10-20 20:25–21:37)
+
+Три площадки, образ `0.261020.20` → `0.261020.21` (фикс #12, `34c8b0a`):
+- **прод home-nuc2 :8000** — idle × pace0 × error (прод-конфиг), ~1.7 ч;
+- **Hermes-Sandbox b2/b3** (:8002/:8003) — always × pace0/1 × error, ~1.1 ч;
+- **Hermes-Sandbox b4/b5** (:8004/:8005) — idle × pace1 × nosignal и
+  always × pace0 × nosignal + параллельные запросы, ~15 мин.
+
+Покрытие комбинаций (WORKER_MODE × PACE_FRAMES × OFFLINE_RESPONSE):
+| Комбинация | Площадка |
+|---|---|
+| idle × 0 × error | прод |
+| idle × 1 × nosignal | b4 |
+| always × 0 × error | b2 |
+| always × 1 × error | b3 |
+| always × 0 × nosignal | b5 |
+
+Ключевые результаты:
+- **Прод**: cold frame ch4 6.23с / ch8 5.79с, warm 3.52с; sub/main 15с 200
+  (first 1.0–1.4с; main 5.08 МБ); preview 4 раза 200 (23.5–26.3с, 10 онлайн +
+  6 NO SIGNAL); снапшоты 1.6–3.98с 200. Паузы 15+15+10+8 мин: reaper собрал
+  воркеров (workers []), снапшот после каждой паузы 200 (TTL re-login работает,
+  1.6–3.98с). Restart → live 16с, cold 8.01с. Redeploy (Forgejo → 0.261020.21)
+  → success, cold 5.86с, sub/main/preview 200.
+- **Прод soak на 0.261020.21** (15 мин): **4 параллельных снапшота** — ch8/4/2
+  200 (2.2с), ch12 (оффлайн) 502 JSON (21.6с) — корректный error-режим; 3
+  пульса 200 (frame 4.6–5.6с, snap 1.2–1.8с); финал workers 0 (reaper).
+- **Sandbox b2/b3** (always): cold 4.18/4.44с, warm 2.33–4.35с; sub 60с 1.01 МБ,
+  main 60с 20.3 МБ (b2), sub 30с (b3); снапшоты t+8/20/35 мин — все 200
+  (1.7–2.0с, re-login TTL в always-режиме); preview 23.6/25.4с; soak 45 мин:
+  9/9 пульсов 200 (2.15–5.62с), workers 3 (всегда поднят); restart → live 25с,
+  cold 4.62с, snap 2.12с. Память: активный 71.8–88.3 МБ, idle 12.9–13.9 МБ.
+- **Sandbox b4** (idle × pace1 × nosignal): cold 3.52с, warm [2.18, 4.22, 3.98],
+  sub 20с 200 (first 0.8с), онлайн-снапшот 1.66с (без X-Camera-Status);
+  **оффлайн ch16: snapshot 200 + NO SIGNAL JPEG (6.9 КБ) + X-Camera-Status:
+  no-signal + X-Error: 502 (21.3с); frame ch16 200 + NO SIGNAL (20с)** —
+  паника #12 не воспроизводится (до фикса — обрыв соединения); reaper: workers [].
+- **Sandbox b5 — параллельные запросы к разным эндпоинтам (все 200, no deadlock)**:
+  - burst1 (5 одновременно): frame ch4 4.82с + frame ch8 4.63с + snapshot 1.9с
+    + stream sub 10с + preview 23.2с;
+  - burst2 (тяжёлый): 2× main-стрим 15с (по 5.03 МБ, first 0.85с) + frame 3.18с
+    + snapshot оффлайн ch16 21.3с (nosignal-JPEG);
+  - (3-мин mixed-loop в скрипте заглох на чтении бесконечного TS-потока —
+    артефакт скрипта; покрытие смешанной нагрузки дублируют soak'и: прод 15 мин
+    и b2 45 мин).
+
+Выводы:
+- Все 4 комбинации worker_mode × pace работают; nosignal-режим корректен
+  (JPEG + заголовки, без паник), error-режим — 502 JSON.
+- Параллельные запросы к разным эндпоинтам (включая 2× main-стрим + frame +
+  snapshot одновременно) — deadlock'ов нет, все 200.
+- Re-login снапшот-сессии (TTL 4 мин) подтверждён на проде (4 паузы суммарно
+  48 мин) и в песочнице (3 снапшота с интервалами 8–35 мин).
+- Один сбой прод-батареи — гонка её же redeploy'а со следующим этапом (смена
+  контейнера во время 20-сек оффлайн-снапшота), не баг кода; дожат доп. soak.
+
+Данные: `batt2-prod.jsonl`, `batt2-prod-soak.jsonl` (локально, scratch),
+`batt2-sandbox.jsonl`, `batt3-sandbox.jsonl` (скопированы в scratch).
+Скрипты: `batt2_prod.py`, `batt2_sandbox.py`, `batt3_sandbox.py`,
+`batt2_prod_soak.py`.
