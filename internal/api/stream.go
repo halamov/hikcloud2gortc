@@ -5,9 +5,9 @@ package api
 import (
 	"context"
 	"fmt"
-	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"os/exec"
 	"strconv"
 	"time"
@@ -86,18 +86,11 @@ func detectAnnexBCodec(head []byte) string {
 	return "hevc" // парк NVR гоняет HEVC
 }
 
-type flushWriter struct {
-	w  http.ResponseWriter
-	fl http.Flusher
-}
-
-func (f *flushWriter) Write(p []byte) (int, error) {
-	n, err := f.w.Write(p)
-	if f.fl != nil && err == nil {
-		f.fl.Flush()
-	}
-	return n, err
-}
+// clientWriteTimeout — дедлайн на запись в клиент: если зритель перестал
+// читать (зависший/мёртвый клиент), TCP-буфер заполнится, запись упрётся
+// в дедлайн и handler завершится → воркер освобождается reaper'ом.
+// 30 с — с большим запасом над GOP (~4 с) и медленным интернетом зрителя.
+const clientWriteTimeout = 30 * time.Second
 
 // remuxToTS — Annex-B → MPEG-TS через ffmpeg (pipe), стримим в клиент.
 func (s *Server) remuxToTS(ctx context.Context, w http.ResponseWriter, fl http.Flusher, codec string, head []byte, rest <-chan []byte) {
@@ -131,7 +124,26 @@ func (s *Server) remuxToTS(ctx context.Context, w http.ResponseWriter, fl http.F
 			}
 		}
 	}()
-	_, _ = io.Copy(&flushWriter{w: w, fl: fl}, stdout)
+	// копия ffmpeg stdout → клиент с дедлайном записи (вместо io.Copy):
+	// зависший клиент не должен держать ffmpeg и воркер вечно
+	rc := http.NewResponseController(w)
+	buf := make([]byte, 256*1024)
+	for {
+		n, rerr := stdout.Read(buf)
+		if n > 0 {
+			_ = rc.SetWriteDeadline(time.Now().Add(clientWriteTimeout))
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				s.log.Warn("stream.ts (remux): клиент не читает — закрываю", "err", werr)
+				break
+			}
+			if fl != nil {
+				fl.Flush()
+			}
+		}
+		if rerr != nil {
+			break
+		}
+	}
 	_ = cmd.Process.Kill()
 	_ = cmd.Wait() // забираем процесс, иначе ffmpeg остаётся зомби
 }
@@ -139,7 +151,11 @@ func (s *Server) remuxToTS(ctx context.Context, w http.ResponseWriter, fl http.F
 // handleStreamTS — GET /stream.ts?channel=&serial=&stream=
 func (s *Server) handleStreamTS(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	channel := qInt(q.Get("channel"))
+	channel, cerr := qChannel(q)
+	if cerr != nil {
+		writeErr(w, cerr)
+		return
+	}
 	stream := q.Get("stream")
 	if stream != "sub" && stream != "main" && stream != "auto" {
 		stream = s.cfg.DefaultStream
@@ -172,6 +188,7 @@ func (s *Server) handleStreamTS(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "video/mp2t")
 	w.Header().Set("Cache-Control", "no-store")
 	fl, _ := w.(http.Flusher)
+	rc := http.NewResponseController(w)
 
 	if len(first) > 0 && first[0] == 0x47 {
 		// воркер уже отдаёт MPEG-TS — pass-through
@@ -184,7 +201,11 @@ func (s *Server) handleStreamTS(w http.ResponseWriter, r *http.Request) {
 				if !ok {
 					return
 				}
+				// проверка клиента: дедлайн записи (мёртвый зритель не должен
+				// держать воркер с VTM-сессией вечно)
+				_ = rc.SetWriteDeadline(time.Now().Add(clientWriteTimeout))
 				if _, err := w.Write(b); err != nil {
+					s.log.Warn("stream.ts: клиент не читает — закрываю", "sn", wk.SN, "err", err)
 					return
 				}
 				if fl != nil {
@@ -201,7 +222,11 @@ func (s *Server) handleStreamTS(w http.ResponseWriter, r *http.Request) {
 // handlePrime — GET /prime?channel=&serial=&stream=main
 func (s *Server) handlePrime(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	channel := qInt(q.Get("channel"))
+	channel, cerr := qChannel(q)
+	if cerr != nil {
+		writeErr(w, cerr)
+		return
+	}
 	stream := q.Get("stream")
 	if stream != "sub" && stream != "main" {
 		stream = "main"
@@ -230,6 +255,20 @@ func (s *Server) handlePrime(w http.ResponseWriter, r *http.Request) {
 func qInt(s string) int {
 	n, _ := strconv.Atoi(s)
 	return n
+}
+
+// qChannel — channel из query: пустой → 0 (дефолтная камера),
+// валидное число → оно, мусор → 400 (не молчаливый дефолт).
+func qChannel(q url.Values) (int, error) {
+	v := q.Get("channel")
+	if v == "" {
+		return 0, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return 0, httpErr(400, "channel: некорректное значение %q (нужно целое ≥ 0)", v)
+	}
+	return n, nil
 }
 
 func round2(f float64) float64 { return math.Round(f*100) / 100 }
